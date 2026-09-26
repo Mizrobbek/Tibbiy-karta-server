@@ -21,13 +21,14 @@ def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
 def init_db():
     conn = get_db()
     conn.execute("""CREATE TABLE IF NOT EXISTS patients (id TEXT PRIMARY KEY, med_id TEXT UNIQUE,
-        full_name TEXT NOT NULL, birth_date TEXT, gender TEXT, phone TEXT, address TEXT, family_doctor TEXT)""")
+        full_name TEXT NOT NULL, birth_date TEXT, gender TEXT, phone TEXT, address TEXT, family_doctor TEXT,
+        region TEXT, district TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS visits (id TEXT PRIMARY KEY, patient_id TEXT NOT NULL,
-        date TEXT, doctor TEXT, complaint TEXT, diagnosis TEXT, prescription TEXT, next_visit_date TEXT,
+        date TEXT, doctor TEXT, complaint TEXT, diagnosis TEXT, prescription TEXT, next_visit_date TEXT, inn_name TEXT,
         FOREIGN KEY(patient_id) REFERENCES patients(id))""")
     conn.execute("""CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL, role TEXT NOT NULL, full_name TEXT, patient_id TEXT,
-        email TEXT, phone TEXT, avatar TEXT)""")
+        email TEXT, phone TEXT, avatar TEXT, region TEXT, district TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, patient_id TEXT NOT NULL,
         sender_role TEXT, sender_name TEXT, body TEXT, created_at TEXT)""")
@@ -36,8 +37,11 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS support_messages (id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
         sender_role TEXT, sender_name TEXT, body TEXT, created_at TEXT)""")
     for stmt in ["ALTER TABLE visits ADD COLUMN next_visit_date TEXT",
+                 "ALTER TABLE visits ADD COLUMN inn_name TEXT",
                  "ALTER TABLE users ADD COLUMN email TEXT", "ALTER TABLE users ADD COLUMN phone TEXT",
-                 "ALTER TABLE users ADD COLUMN avatar TEXT"]:
+                 "ALTER TABLE users ADD COLUMN avatar TEXT", "ALTER TABLE users ADD COLUMN region TEXT",
+                 "ALTER TABLE users ADD COLUMN district TEXT", "ALTER TABLE patients ADD COLUMN region TEXT",
+                 "ALTER TABLE patients ADD COLUMN district TEXT"]:
         try: conn.execute(stmt)
         except sqlite3.OperationalError: pass
     if not conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
@@ -83,15 +87,19 @@ class UserCreateIn(BaseModel):
     username: str; password: str; full_name: str; role: str
     birth_date: Optional[str]=None; gender: Optional[str]=None; phone: Optional[str]=None
     address: Optional[str]=None; family_doctor: Optional[str]=None; email: Optional[str]=None
+    region: Optional[str]=None; district: Optional[str]=None
 class UserEditIn(BaseModel):
     full_name: Optional[str]=None; email: Optional[str]=None; phone: Optional[str]=None
     birth_date: Optional[str]=None; gender: Optional[str]=None; address: Optional[str]=None; family_doctor: Optional[str]=None
+    region: Optional[str]=None; district: Optional[str]=None
 class PatientIn(BaseModel):
     full_name: str; birth_date: Optional[str]=None; gender: Optional[str]=None
     phone: Optional[str]=None; address: Optional[str]=None; family_doctor: Optional[str]=None
+    region: Optional[str]=None; district: Optional[str]=None
 class VisitIn(BaseModel):
     date: str; doctor: Optional[str]=None; complaint: Optional[str]=None
     diagnosis: Optional[str]=None; prescription: Optional[str]=None; next_visit_date: Optional[str]=None
+    inn_name: Optional[str]=None
 class MessageIn(BaseModel): body: str
 class RatingIn(BaseModel): doctor_name: str; stars: int; comment: Optional[str]=None
 
@@ -148,7 +156,7 @@ def update_profile(body: ProfileUpdateIn, authorization: Optional[str] = Header(
 def list_users(authorization: Optional[str] = Header(None)):
     user = current_user(authorization); require_admin(user)
     conn = get_db()
-    rows = conn.execute("SELECT id, username, role, full_name, patient_id, email, phone, avatar FROM users").fetchall()
+    rows = conn.execute("SELECT id, username, role, full_name, patient_id, email, phone, avatar, region, district FROM users").fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -162,10 +170,10 @@ def create_user(u: UserCreateIn, authorization: Optional[str] = Header(None)):
     uid = str(uuid.uuid4()); patient_id = None
     if u.role == "bemor":
         patient_id = str(uuid.uuid4())
-        conn.execute("INSERT INTO patients (id, med_id, full_name, birth_date, gender, phone, address, family_doctor) VALUES (?,?,?,?,?,?,?,?)",
-                     (patient_id, gen_med_id(), u.full_name, u.birth_date, u.gender, u.phone, u.address, u.family_doctor))
-    conn.execute("INSERT INTO users (id, username, password_hash, role, full_name, patient_id, email, phone) VALUES (?,?,?,?,?,?,?,?)",
-                 (uid, u.username, hash_pw(u.password), u.role, u.full_name, patient_id, u.email, u.phone))
+        conn.execute("INSERT INTO patients (id, med_id, full_name, birth_date, gender, phone, address, family_doctor, region, district) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                     (patient_id, gen_med_id(), u.full_name, u.birth_date, u.gender, u.phone, u.address, u.family_doctor, u.region, u.district))
+    conn.execute("INSERT INTO users (id, username, password_hash, role, full_name, patient_id, email, phone, region, district) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                 (uid, u.username, hash_pw(u.password), u.role, u.full_name, patient_id, u.email, u.phone, u.region, u.district))
     conn.commit(); conn.close()
     return {"id": uid, "patient_id": patient_id}
 
@@ -178,9 +186,11 @@ def edit_user(user_id: str, u: UserEditIn, authorization: Optional[str] = Header
     if u.full_name is not None: conn.execute("UPDATE users SET full_name=? WHERE id=?", (u.full_name, user_id))
     if u.email is not None: conn.execute("UPDATE users SET email=? WHERE id=?", (u.email, user_id))
     if u.phone is not None: conn.execute("UPDATE users SET phone=? WHERE id=?", (u.phone, user_id))
+    if u.region is not None: conn.execute("UPDATE users SET region=? WHERE id=?", (u.region, user_id))
+    if u.district is not None: conn.execute("UPDATE users SET district=? WHERE id=?", (u.district, user_id))
     if target["patient_id"]:
         for field, val in [("full_name",u.full_name),("birth_date",u.birth_date),("gender",u.gender),
-                            ("address",u.address),("family_doctor",u.family_doctor)]:
+                            ("address",u.address),("family_doctor",u.family_doctor),("region",u.region),("district",u.district)]:
             if val is not None: conn.execute(f"UPDATE patients SET {field}=? WHERE id=?", (val, target["patient_id"]))
         if u.phone is not None: conn.execute("UPDATE patients SET phone=? WHERE id=?", (u.phone, target["patient_id"]))
     conn.commit(); conn.close()
@@ -225,8 +235,8 @@ def list_patients(q: Optional[str] = None, authorization: Optional[str] = Header
 def create_patient(p: PatientIn, authorization: Optional[str] = Header(None)):
     user = current_user(authorization); require_staff(user)
     conn = get_db(); pid = str(uuid.uuid4()); med_id = gen_med_id()
-    conn.execute("INSERT INTO patients (id, med_id, full_name, birth_date, gender, phone, address, family_doctor) VALUES (?,?,?,?,?,?,?,?)",
-                 (pid, med_id, p.full_name, p.birth_date, p.gender, p.phone, p.address, p.family_doctor))
+    conn.execute("INSERT INTO patients (id, med_id, full_name, birth_date, gender, phone, address, family_doctor, region, district) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                 (pid, med_id, p.full_name, p.birth_date, p.gender, p.phone, p.address, p.family_doctor, p.region, p.district))
     conn.commit(); conn.close()
     return {"id": pid, "med_id": med_id}
 
@@ -257,8 +267,8 @@ def add_visit(patient_id: str, v: VisitIn, authorization: Optional[str] = Header
     conn = get_db()
     if not conn.execute("SELECT 1 FROM patients WHERE id=?", (patient_id,)).fetchone(): raise HTTPException(404, "Bemor topilmadi")
     vid = str(uuid.uuid4())
-    conn.execute("INSERT INTO visits (id, patient_id, date, doctor, complaint, diagnosis, prescription, next_visit_date) VALUES (?,?,?,?,?,?,?,?)",
-                 (vid, patient_id, v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.next_visit_date))
+    conn.execute("INSERT INTO visits (id, patient_id, date, doctor, complaint, diagnosis, prescription, next_visit_date, inn_name) VALUES (?,?,?,?,?,?,?,?,?)",
+                 (vid, patient_id, v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.next_visit_date, v.inn_name))
     conn.commit(); conn.close()
     return {"id": vid}
 
@@ -430,7 +440,7 @@ def dmed_export(authorization: Optional[str] = Header(None)):
         result["patients"].append({"medId": p["med_id"], "fullName": p["full_name"], "birthDate": p["birth_date"],
             "gender": p["gender"], "phone": p["phone"], "address": p["address"], "familyDoctor": p["family_doctor"],
             "encounters": [{"date": v["date"], "doctor": v["doctor"], "complaint": v["complaint"], "diagnosis": v["diagnosis"],
-                            "prescription": v["prescription"], "nextVisitDate": v["next_visit_date"]} for v in visits]})
+                            "prescription": v["prescription"], "nextVisitDate": v["next_visit_date"], "innName": v["inn_name"]} for v in visits]})
     conn.close()
     return result
 
