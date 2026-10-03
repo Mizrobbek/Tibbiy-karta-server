@@ -7,14 +7,25 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3, uuid, random, datetime, os, hashlib, secrets
+import sqlite3, uuid, random, datetime, os, hashlib, secrets, re
 
 DB_PATH = "tibbiy_karta.db"
 app = FastAPI(title="Elektron Tibbiy Karta API", version="6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+def normalize_phone(s):
+    """Telefonni '998901234567' ko'rinishiga keltiradi; noto'g'ri bo'lsa '' qaytaradi."""
+    digits = re.sub(r"\D", "", s or "")
+    if len(digits) == 9: digits = "+998" + digits
+    return digits if (len(digits) == 12 and digits.startswith("+998")) else ""
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; return conn
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+    conn.create_function("norm_phone", 1, lambda v: normalize_phone(v) or None)
+    return conn
+
+ALLOW_SELF_REGISTRATION = os.environ.get("ALLOW_SELF_REGISTRATION", "1") == "1"
+ROLE_GROUPS = {"bemor": ("bemor",), "shifokor": ("shifokor",), "admin": ("admin", "super_admin")}
 
 def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
 def gen_med_id(): return f"UZ-MED-{random.randint(10**11, 10**12 - 1)}"
@@ -39,10 +50,14 @@ def init_db():
         patient_name TEXT, doctor_name TEXT, stars INTEGER, comment TEXT, created_at TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS support_messages (id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
         sender_role TEXT, sender_name TEXT, body TEXT, created_at TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS appointments (id TEXT PRIMARY KEY, clinic_id TEXT NOT NULL,
+        patient_id TEXT NOT NULL, patient_name TEXT, doctor_name TEXT, date TEXT, queue_number INTEGER,
+        status TEXT DEFAULT 'kutilmoqda', created_at TEXT, checked_in_at TEXT)""")
     for stmt in ["ALTER TABLE visits ADD COLUMN next_visit_date TEXT", "ALTER TABLE visits ADD COLUMN inn_name TEXT",
                  "ALTER TABLE users ADD COLUMN email TEXT", "ALTER TABLE users ADD COLUMN phone TEXT",
                  "ALTER TABLE users ADD COLUMN avatar TEXT", "ALTER TABLE users ADD COLUMN region TEXT",
                  "ALTER TABLE users ADD COLUMN district TEXT", "ALTER TABLE users ADD COLUMN clinic_id TEXT",
+                 "ALTER TABLE users ADD COLUMN birth_date TEXT",
                  "ALTER TABLE patients ADD COLUMN region TEXT", "ALTER TABLE patients ADD COLUMN district TEXT",
                  "ALTER TABLE patients ADD COLUMN clinic_id TEXT"]:
         try: conn.execute(stmt)
@@ -63,7 +78,9 @@ def init_db():
     has_super = bool(conn.execute("SELECT 1 FROM users WHERE role='super_admin' LIMIT 1").fetchone())
     if not has_super:
         conn.execute("INSERT INTO users (id, username, password_hash, role, full_name) VALUES (?,?,?,?,?)",
-                      (str(uuid.uuid4()), "superadmin", hash_pw("super123"), "super_admin", "Tizim egasi"))
+                      (str(uuid.uuid4()), "superadmin", hash_pw("super123"), "super_admin", "Bosh super-admin"))
+    # eski bazalarda "Tizim egasi" nomi "rol: Tizim egasi" bilan takrorlanib ko'rinardi — tuzatamiz
+    conn.execute("UPDATE users SET full_name='Bosh super-admin' WHERE role='super_admin' AND full_name='Tizim egasi'")
     if not any_user_exists:
         conn.execute("INSERT INTO users (id, username, password_hash, role, full_name, clinic_id) VALUES (?,?,?,?,?,?)",
                       (str(uuid.uuid4()), "admin", hash_pw("admin123"), "admin", "Bosh administrator", default_clinic_id))
@@ -100,7 +117,8 @@ def period_start(period):
     else: start = today - datetime.timedelta(days=3650)
     return start.isoformat()
 
-class LoginIn(BaseModel): username: str; password: str
+class LoginIn(BaseModel): username: str; password: str; role: Optional[str]=None
+class RegisterIn(BaseModel): full_name: str; phone: str; birth_date: Optional[str]=None; password: str; role: str
 class ChangeCredentialsIn(BaseModel):
     old_password: str; new_username: Optional[str]=None; new_password: Optional[str]=None
 class ProfileUpdateIn(BaseModel):
@@ -127,23 +145,67 @@ class VisitIn(BaseModel):
     inn_name: Optional[str]=None
 class MessageIn(BaseModel): body: str
 class RatingIn(BaseModel): doctor_name: str; stars: int; comment: Optional[str]=None
+class AppointmentIn(BaseModel): doctor_name: str; date: str
 
 # ---------- Auth ----------
-@app.post("/auth/login")
-def login(l: LoginIn):
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE username=? AND password_hash=?", (l.username, hash_pw(l.password))).fetchone()
-    if not user: conn.close(); raise HTTPException(401, "Login yoki parol xato")
+def login_payload(conn, user):
     token = secrets.token_hex(24)
     conn.execute("INSERT INTO sessions (token, user_id, created_at) VALUES (?,?,?)", (token, user["id"], datetime.datetime.utcnow().isoformat()))
     clinic_name = None
     if user["clinic_id"]:
         c = conn.execute("SELECT name FROM clinics WHERE id=?", (user["clinic_id"],)).fetchone()
         clinic_name = c["name"] if c else None
-    conn.commit(); conn.close()
     return {"token": token, "role": user["role"], "full_name": user["full_name"], "patient_id": user["patient_id"],
             "username": user["username"], "email": user["email"], "phone": user["phone"], "avatar": user["avatar"],
             "clinic_id": user["clinic_id"], "clinic_name": clinic_name}
+
+@app.post("/auth/login")
+def login(l: LoginIn):
+    """Login sifatida foydalanuvchi nomi YOKI telefon raqam qabul qilinadi."""
+    conn = get_db()
+    raw = l.username.strip()
+    np = normalize_phone(raw)
+    rows = conn.execute("SELECT * FROM users WHERE username=? OR norm_phone(phone)=?", (raw, np or "-")).fetchall()
+    pw = hash_pw(l.password)
+    user = next((u for u in rows if u["password_hash"] == pw), None)
+    if not user: conn.close(); raise HTTPException(401, "Login yoki parol xato")
+    if l.role and user["role"] not in ROLE_GROUPS.get(l.role, ()):
+        conn.close(); raise HTTPException(403, "Bu hisob tanlangan rolga mos emas. Rolni qaytadan tanlang")
+    payload = login_payload(conn, user)
+    conn.commit(); conn.close()
+    return payload
+
+@app.get("/auth/config")
+def auth_config():
+    return {"registration_open": ALLOW_SELF_REGISTRATION}
+
+@app.post("/auth/register")
+def register(r: RegisterIn):
+    """VAQTINCHA (test uchun) ochiq ro'yxatdan o'tish. ALLOW_SELF_REGISTRATION=0 bilan o'chiriladi."""
+    if not ALLOW_SELF_REGISTRATION:
+        raise HTTPException(403, "Ro'yxatdan o'tish o'chirilgan — hisobni klinika administratoridan oling")
+    if r.role not in ("bemor", "shifokor"): raise HTTPException(400, "Rol bemor yoki shifokor bo'lishi kerak")
+    name = r.full_name.strip()
+    if len(name) < 3: raise HTTPException(400, "Ism familiyani to'liq kiriting")
+    np = normalize_phone(r.phone)
+    if not np: raise HTTPException(400, "Telefon raqam noto'g'ri (+998 XX XXX XX XX)")
+    if len(r.password) < 6: raise HTTPException(400, "Parol kamida 6 belgidan iborat bo'lishi kerak")
+    conn = get_db()
+    if conn.execute("SELECT 1 FROM users WHERE username=? OR norm_phone(phone)=?", (np, np)).fetchone():
+        conn.close(); raise HTTPException(400, "Bu telefon raqam bilan hisob allaqachon mavjud")
+    clinic = conn.execute("SELECT id FROM clinics ORDER BY created_at ASC LIMIT 1").fetchone()
+    clinic_id = clinic["id"] if clinic else None
+    uid = str(uuid.uuid4()); patient_id = None; phone_store = "+" + np
+    if r.role == "bemor":
+        patient_id = str(uuid.uuid4())
+        conn.execute("INSERT INTO patients (id, med_id, full_name, birth_date, phone, clinic_id) VALUES (?,?,?,?,?,?)",
+                     (patient_id, gen_med_id(), name, r.birth_date, phone_store, clinic_id))
+    conn.execute("INSERT INTO users (id, username, password_hash, role, full_name, patient_id, phone, birth_date, clinic_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                 (uid, np, hash_pw(r.password), r.role, name, patient_id, phone_store, r.birth_date, clinic_id))
+    user = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    payload = login_payload(conn, user)
+    conn.commit(); conn.close()
+    return payload
 
 @app.post("/auth/change-credentials")
 def change_credentials(body: ChangeCredentialsIn, authorization: Optional[str] = Header(None)):
@@ -160,8 +222,13 @@ def change_credentials(body: ChangeCredentialsIn, authorization: Optional[str] =
 
 @app.post("/auth/reset-password")
 def reset_password(body: ResetPasswordIn):
+    if len(body.new_password) < 6: raise HTTPException(400, "Parol kamida 6 belgidan iborat bo'lishi kerak")
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE username=? AND phone=?", (body.username, body.phone)).fetchone()
+    ident = body.username.strip()
+    np_ident = normalize_phone(ident)
+    np_phone = normalize_phone(body.phone)
+    rows = conn.execute("SELECT * FROM users WHERE username=? OR norm_phone(phone)=?", (ident, np_ident or "-")).fetchall()
+    user = next((u for u in rows if np_phone and normalize_phone(u["phone"]) == np_phone), None)
     if not user: conn.close(); raise HTTPException(404, "Login yoki telefon raqam mos kelmadi")
     conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_pw(body.new_password), user["id"]))
     conn.commit(); conn.close()
@@ -544,6 +611,86 @@ def doctor_stats(period: str = "daily", authorization: Optional[str] = Header(No
     return {"period": period, "visit_count": len(my_visits),
             "visits": [{"patient_name": v["patient_name"], "date": v["date"], "diagnosis": v["diagnosis"]} for v in my_visits],
             "avg_stars": round(rating["avg_stars"],1) if rating["avg_stars"] else None, "rating_count": rating["cnt"]}
+
+# ---------- Navbat olish (QR bilan) ----------
+@app.post("/appointments")
+def book_appointment(a: AppointmentIn, authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    if user["role"] != "bemor": raise HTTPException(403, "Faqat bemor navbat olishi mumkin")
+    conn = get_db()
+    existing = conn.execute("SELECT COUNT(*) as c FROM appointments WHERE clinic_id=? AND doctor_name=? AND date=? AND status != 'bekor qilindi'",
+                             (user["clinic_id"], a.doctor_name, a.date)).fetchone()["c"]
+    queue_number = existing + 1
+    aid = str(uuid.uuid4())
+    patient = conn.execute("SELECT full_name FROM patients WHERE id=?", (user["patient_id"],)).fetchone()
+    conn.execute("""INSERT INTO appointments (id, clinic_id, patient_id, patient_name, doctor_name, date, queue_number, status, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (aid, user["clinic_id"], user["patient_id"], patient["full_name"] if patient else "", a.doctor_name, a.date,
+         queue_number, "kutilmoqda", datetime.datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    return {"id": aid, "queue_number": queue_number}
+
+@app.get("/appointments/me")
+def my_appointments(authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    if user["role"] != "bemor": raise HTTPException(403, "Faqat bemor uchun")
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM appointments WHERE patient_id=? ORDER BY date DESC, queue_number ASC", (user["patient_id"],)).fetchall()
+    result = []
+    for r in rows:
+        ahead = 0
+        if r["status"] == "kutilmoqda":
+            ahead = conn.execute("""SELECT COUNT(*) as c FROM appointments WHERE clinic_id=? AND doctor_name=? AND date=?
+                AND status='kutilmoqda' AND queue_number < ?""", (r["clinic_id"], r["doctor_name"], r["date"], r["queue_number"])).fetchone()["c"]
+        result.append({**dict(r), "ahead_count": ahead})
+    conn.close()
+    return result
+
+@app.get("/appointments/today")
+def appointments_today(date: Optional[str] = None, authorization: Optional[str] = Header(None)):
+    user = current_user(authorization); require_staff(user)
+    the_date = date or datetime.date.today().isoformat()
+    conn = get_db()
+    if user["role"] == "shifokor":
+        rows = conn.execute("SELECT * FROM appointments WHERE clinic_id=? AND date=? AND doctor_name=? ORDER BY queue_number ASC",
+                             (user["clinic_id"], the_date, user["full_name"])).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM appointments WHERE clinic_id=? AND date=? ORDER BY doctor_name, queue_number ASC",
+                             (user["clinic_id"], the_date)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.post("/appointments/{appt_id}/checkin")
+def checkin_appointment(appt_id: str, authorization: Optional[str] = Header(None)):
+    user = current_user(authorization); require_staff(user)
+    conn = get_db()
+    a = conn.execute("SELECT * FROM appointments WHERE id=? AND clinic_id=?", (appt_id, user["clinic_id"])).fetchone()
+    if not a: raise HTTPException(404, "Navbat topilmadi")
+    conn.execute("UPDATE appointments SET status='keldi', checked_in_at=? WHERE id=?", (datetime.datetime.utcnow().isoformat(), appt_id))
+    conn.commit(); conn.close()
+    return {"status":"keldi"}
+
+@app.post("/appointments/{appt_id}/complete")
+def complete_appointment(appt_id: str, authorization: Optional[str] = Header(None)):
+    user = current_user(authorization); require_staff(user)
+    conn = get_db()
+    a = conn.execute("SELECT * FROM appointments WHERE id=? AND clinic_id=?", (appt_id, user["clinic_id"])).fetchone()
+    if not a: raise HTTPException(404, "Navbat topilmadi")
+    conn.execute("UPDATE appointments SET status='yakunlandi' WHERE id=?", (appt_id,))
+    conn.commit(); conn.close()
+    return {"status":"yakunlandi"}
+
+@app.post("/appointments/{appt_id}/cancel")
+def cancel_appointment(appt_id: str, authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    conn = get_db()
+    a = conn.execute("SELECT * FROM appointments WHERE id=?", (appt_id,)).fetchone()
+    if not a: raise HTTPException(404, "Navbat topilmadi")
+    if user["role"] == "bemor" and a["patient_id"] != user["patient_id"]: raise HTTPException(403, "Ruxsat yo'q")
+    if user["role"] in ("shifokor","admin") and a["clinic_id"] != user["clinic_id"]: raise HTTPException(403, "Ruxsat yo'q")
+    conn.execute("UPDATE appointments SET status='bekor qilindi' WHERE id=?", (appt_id,))
+    conn.commit(); conn.close()
+    return {"status":"bekor qilindi"}
 
 # ---------- DMED (klinika doirasida) ----------
 @app.get("/dmed/export")
