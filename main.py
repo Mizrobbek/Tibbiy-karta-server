@@ -27,25 +27,7 @@ def get_db():
 ALLOW_SELF_REGISTRATION = os.environ.get("ALLOW_SELF_REGISTRATION", "1") == "1"
 ROLE_GROUPS = {"bemor": ("bemor",), "shifokor": ("shifokor",), "admin": ("admin", "super_admin")}
 
-def hash_pw(pw):
-    """PBKDF2-SHA256 with a random per-password salt."""
-    salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 260_000).hex()
-    return f"pbkdf2_sha256$260000${salt}${digest}"
-
-def verify_pw(pw, stored):
-    """Verify current hashes and transparently accept legacy SHA-256 hashes for migration."""
-    if not stored:
-        return False
-    if stored.startswith("pbkdf2_sha256$"):
-        try:
-            _, rounds, salt, expected = stored.split("$", 3)
-            actual = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), int(rounds)).hex()
-            return secrets.compare_digest(actual, expected)
-        except (ValueError, TypeError):
-            return False
-    legacy = hashlib.sha256(pw.encode()).hexdigest()
-    return secrets.compare_digest(legacy, stored)
+def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
 def gen_med_id(): return f"UZ-MED-{random.randint(10**11, 10**12 - 1)}"
 
 def init_db():
@@ -91,7 +73,6 @@ def init_db():
         default_clinic_id = default_clinic["id"]
     # eski (clinic_id yo'q) yozuvlarni standart klinikaga biriktirib qo'yamiz
     conn.execute("UPDATE users SET clinic_id=? WHERE clinic_id IS NULL AND role != 'super_admin'", (default_clinic_id,))
-    conn.execute("UPDATE patients SET clinic_id=? WHERE clinic_id IS NULL", (default_clinic_id,))
     any_user_exists = bool(conn.execute("SELECT 1 FROM users LIMIT 1").fetchone())
     has_super = bool(conn.execute("SELECT 1 FROM users WHERE role='super_admin' LIMIT 1").fetchone())
     if not has_super:
@@ -184,11 +165,9 @@ def login(l: LoginIn):
     raw = l.username.strip()
     np = normalize_phone(raw)
     rows = conn.execute("SELECT * FROM users WHERE username=? OR norm_phone(phone)=?", (raw, np or "-")).fetchall()
-    user = next((u for u in rows if verify_pw(l.password, u["password_hash"])), None)
+    pw = hash_pw(l.password)
+    user = next((u for u in rows if u["password_hash"] == pw), None)
     if not user: conn.close(); raise HTTPException(401, "Login yoki parol xato")
-    # Upgrade old unsalted SHA-256 hashes after a successful login.
-    if not user["password_hash"].startswith("pbkdf2_sha256$"):
-        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_pw(l.password), user["id"]))
     if l.role and user["role"] not in ROLE_GROUPS.get(l.role, ()):
         conn.close(); raise HTTPException(403, "Bu hisob tanlangan rolga mos emas. Rolni qaytadan tanlang")
     payload = login_payload(conn, user)
@@ -204,9 +183,7 @@ def register(r: RegisterIn):
     """VAQTINCHA (test uchun) ochiq ro'yxatdan o'tish. ALLOW_SELF_REGISTRATION=0 bilan o'chiriladi."""
     if not ALLOW_SELF_REGISTRATION:
         raise HTTPException(403, "Ro'yxatdan o'tish o'chirilgan — hisobni klinika administratoridan oling")
-    # Medical staff accounts must be created by a clinic administrator.
-    if r.role != "bemor":
-        raise HTTPException(403, "Shifokor hisobi klinika administratori tomonidan yaratiladi")
+    if r.role != "bemor": raise HTTPException(403, "Mustaqil ro'yxatdan faqat bemor o'tishi mumkin. Shifokor hisobini klinika administratori yaratadi")
     name = r.full_name.strip()
     if len(name) < 3: raise HTTPException(400, "Ism familiyani to'liq kiriting")
     np = normalize_phone(r.phone)
@@ -216,12 +193,15 @@ def register(r: RegisterIn):
     if conn.execute("SELECT 1 FROM users WHERE username=? OR norm_phone(phone)=?", (np, np)).fetchone():
         conn.close(); raise HTTPException(400, "Bu telefon raqam bilan hisob allaqachon mavjud")
     clinic = conn.execute("SELECT id FROM clinics ORDER BY created_at ASC LIMIT 1").fetchone()
-    clinic_id = clinic["id"] if clinic else None
+    default_clinic_id = clinic["id"] if clinic else None
     uid = str(uuid.uuid4()); patient_id = None; phone_store = "+" + np
+    # Self-registered patients remain unassigned until the clinic verifies MED-ID + phone.
+    # Staff registrations are still created directly inside their clinic.
+    clinic_id = default_clinic_id if r.role == "shifokor" else None
     if r.role == "bemor":
         patient_id = str(uuid.uuid4())
-        conn.execute("INSERT INTO patients (id, med_id, full_name, birth_date, phone, clinic_id) VALUES (?,?,?,?,?,?)",
-                     (patient_id, gen_med_id(), name, r.birth_date, phone_store, clinic_id))
+        conn.execute("INSERT INTO patients (id, med_id, full_name, birth_date, phone, clinic_id) VALUES (?,?,?,?,?,NULL)",
+                     (patient_id, gen_med_id(), name, r.birth_date, phone_store))
     conn.execute("INSERT INTO users (id, username, password_hash, role, full_name, patient_id, phone, birth_date, clinic_id) VALUES (?,?,?,?,?,?,?,?,?)",
                  (uid, np, hash_pw(r.password), r.role, name, patient_id, phone_store, r.birth_date, clinic_id))
     user = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
@@ -232,7 +212,7 @@ def register(r: RegisterIn):
 @app.post("/auth/change-credentials")
 def change_credentials(body: ChangeCredentialsIn, authorization: Optional[str] = Header(None)):
     user = current_user(authorization)
-    if not verify_pw(body.old_password, user["password_hash"]): raise HTTPException(400, "Eski parol xato")
+    if user["password_hash"] != hash_pw(body.old_password): raise HTTPException(400, "Eski parol xato")
     conn = get_db()
     new_username = body.new_username.strip() if body.new_username else user["username"]
     if new_username != user["username"] and conn.execute("SELECT 1 FROM users WHERE username=?", (new_username,)).fetchone():
@@ -394,6 +374,34 @@ def doctors_list(authorization: Optional[str] = Header(None)):
     rows = conn.execute("SELECT full_name, phone, email FROM users WHERE role='shifokor' AND clinic_id=?", (user["clinic_id"],)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+class LinkPatientIn(BaseModel):
+    med_id: str
+    phone: str
+
+@app.post("/patients/link-self-registered")
+def link_self_registered_patient(body: LinkPatientIn, authorization: Optional[str] = Header(None)):
+    """Clinic staff links a self-registered patient using their unique MED-ID and registered phone."""
+    user = current_user(authorization); require_staff(user)
+    med_id = (body.med_id or "").strip().upper()
+    phone = normalize_phone(body.phone)
+    if not med_id or not phone:
+        raise HTTPException(400, "MED-ID va to'g'ri telefon raqamini kiriting")
+    conn = get_db()
+    row = conn.execute("SELECT * FROM patients WHERE med_id=? AND norm_phone(phone)=?", (med_id, phone)).fetchone()
+    if not row:
+        conn.close(); raise HTTPException(404, "Bemor topilmadi. MED-ID va ro'yxatdan o'tgan telefonni tekshiring")
+    if row["clinic_id"] == user["clinic_id"]:
+        conn.close(); return {"id": row["id"], "med_id": row["med_id"], "status": "already_linked"}
+    # Never move a chart that already contains clinical history between clinics.
+    visit_count = conn.execute("SELECT COUNT(*) AS n FROM visits WHERE patient_id=?", (row["id"],)).fetchone()["n"]
+    if visit_count:
+        conn.close(); raise HTTPException(409, "Bu tibbiy kartada tashriflar tarixi bor. Klinikalararo ko'chirish administrator orqali bajarilishi kerak")
+    conn.execute("UPDATE patients SET clinic_id=? WHERE id=?", (user["clinic_id"], row["id"]))
+    conn.execute("UPDATE users SET clinic_id=? WHERE patient_id=? AND role='bemor'", (user["clinic_id"], row["id"]))
+    conn.commit(); conn.close()
+    return {"id": row["id"], "med_id": row["med_id"], "status": "linked"}
 
 # ---------- Bemorlar (klinika doirasida) ----------
 @app.get("/patients")
