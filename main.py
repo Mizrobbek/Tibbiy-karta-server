@@ -16,8 +16,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 def normalize_phone(s):
     """Telefonni '998901234567' ko'rinishiga keltiradi; noto'g'ri bo'lsa '' qaytaradi."""
     digits = re.sub(r"\D", "", s or "")
-    if len(digits) == 9: digits = "+998" + digits
-    return digits if (len(digits) == 12 and digits.startswith("+998")) else ""
+    if len(digits) == 9: digits = "998" + digits
+    return digits if (len(digits) == 12 and digits.startswith("998")) else ""
 
 def get_db():
     conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
@@ -27,7 +27,25 @@ def get_db():
 ALLOW_SELF_REGISTRATION = os.environ.get("ALLOW_SELF_REGISTRATION", "1") == "1"
 ROLE_GROUPS = {"bemor": ("bemor",), "shifokor": ("shifokor",), "admin": ("admin", "super_admin")}
 
-def hash_pw(pw): return hashlib.sha256(pw.encode()).hexdigest()
+def hash_pw(pw):
+    """PBKDF2-SHA256 with a random per-password salt."""
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 260_000).hex()
+    return f"pbkdf2_sha256$260000${salt}${digest}"
+
+def verify_pw(pw, stored):
+    """Verify current hashes and transparently accept legacy SHA-256 hashes for migration."""
+    if not stored:
+        return False
+    if stored.startswith("pbkdf2_sha256$"):
+        try:
+            _, rounds, salt, expected = stored.split("$", 3)
+            actual = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), int(rounds)).hex()
+            return secrets.compare_digest(actual, expected)
+        except (ValueError, TypeError):
+            return False
+    legacy = hashlib.sha256(pw.encode()).hexdigest()
+    return secrets.compare_digest(legacy, stored)
 def gen_med_id(): return f"UZ-MED-{random.randint(10**11, 10**12 - 1)}"
 
 def init_db():
@@ -166,9 +184,11 @@ def login(l: LoginIn):
     raw = l.username.strip()
     np = normalize_phone(raw)
     rows = conn.execute("SELECT * FROM users WHERE username=? OR norm_phone(phone)=?", (raw, np or "-")).fetchall()
-    pw = hash_pw(l.password)
-    user = next((u for u in rows if u["password_hash"] == pw), None)
+    user = next((u for u in rows if verify_pw(l.password, u["password_hash"])), None)
     if not user: conn.close(); raise HTTPException(401, "Login yoki parol xato")
+    # Upgrade old unsalted SHA-256 hashes after a successful login.
+    if not user["password_hash"].startswith("pbkdf2_sha256$"):
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_pw(l.password), user["id"]))
     if l.role and user["role"] not in ROLE_GROUPS.get(l.role, ()):
         conn.close(); raise HTTPException(403, "Bu hisob tanlangan rolga mos emas. Rolni qaytadan tanlang")
     payload = login_payload(conn, user)
@@ -184,7 +204,9 @@ def register(r: RegisterIn):
     """VAQTINCHA (test uchun) ochiq ro'yxatdan o'tish. ALLOW_SELF_REGISTRATION=0 bilan o'chiriladi."""
     if not ALLOW_SELF_REGISTRATION:
         raise HTTPException(403, "Ro'yxatdan o'tish o'chirilgan — hisobni klinika administratoridan oling")
-    if r.role not in ("bemor", "shifokor"): raise HTTPException(400, "Rol bemor yoki shifokor bo'lishi kerak")
+    # Medical staff accounts must be created by a clinic administrator.
+    if r.role != "bemor":
+        raise HTTPException(403, "Shifokor hisobi klinika administratori tomonidan yaratiladi")
     name = r.full_name.strip()
     if len(name) < 3: raise HTTPException(400, "Ism familiyani to'liq kiriting")
     np = normalize_phone(r.phone)
@@ -210,7 +232,7 @@ def register(r: RegisterIn):
 @app.post("/auth/change-credentials")
 def change_credentials(body: ChangeCredentialsIn, authorization: Optional[str] = Header(None)):
     user = current_user(authorization)
-    if user["password_hash"] != hash_pw(body.old_password): raise HTTPException(400, "Eski parol xato")
+    if not verify_pw(body.old_password, user["password_hash"]): raise HTTPException(400, "Eski parol xato")
     conn = get_db()
     new_username = body.new_username.strip() if body.new_username else user["username"]
     if new_username != user["username"] and conn.execute("SELECT 1 FROM users WHERE username=?", (new_username,)).fetchone():
