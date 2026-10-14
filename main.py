@@ -142,6 +142,8 @@ class VisitIn(BaseModel):
     date: str; doctor: Optional[str]=None; complaint: Optional[str]=None
     diagnosis: Optional[str]=None; prescription: Optional[str]=None; next_visit_date: Optional[str]=None
     inn_name: Optional[str]=None
+class PatientCredentialsIn(BaseModel): username: str; password: str
+
 class MessageIn(BaseModel): body: str
 class RatingIn(BaseModel): doctor_name: str; stars: int; comment: Optional[str]=None
 class AppointmentIn(BaseModel): doctor_name: str; date: str
@@ -331,6 +333,28 @@ def create_user(u: UserCreateIn, authorization: Optional[str] = Header(None)):
     conn.commit(); conn.close()
     return {"id": uid, "patient_id": patient_id}
 
+@app.post("/admin/patients/{patient_id}/credentials")
+def create_existing_patient_credentials(patient_id: str, body: PatientCredentialsIn, authorization: Optional[str] = Header(None)):
+    """Create a patient login for an existing doctor-created chart without creating a duplicate chart."""
+    admin = current_user(authorization); require_admin(admin)
+    username = body.username.strip()
+    if not username or len(body.password) < 8:
+        raise HTTPException(400, "Login majburiy, parol kamida 8 belgidan iborat bo'lishi kerak")
+    conn = get_db()
+    patient = conn.execute("SELECT * FROM patients WHERE id=? AND clinic_id=?", (patient_id, admin["clinic_id"])).fetchone()
+    if not patient:
+        conn.close(); raise HTTPException(404, "Bemor ushbu klinikada topilmadi")
+    existing = conn.execute("SELECT id, username FROM users WHERE patient_id=? AND role='bemor'", (patient_id,)).fetchone()
+    if existing:
+        conn.close(); raise HTTPException(409, "Bu tibbiy kartaga bemor hisobi allaqachon ulangan. Parolni tiklash funksiyasidan foydalaning")
+    if conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+        conn.close(); raise HTTPException(409, "Bu login band, boshqasini tanlang")
+    uid = str(uuid.uuid4())
+    conn.execute("INSERT INTO users (id,username,password_hash,role,full_name,patient_id,phone,birth_date,clinic_id) VALUES (?,?,?,?,?,?,?,?,?)",
+        (uid, username, hash_pw(body.password), "bemor", patient["full_name"], patient_id, patient["phone"], patient["birth_date"], admin["clinic_id"]))
+    conn.commit(); conn.close()
+    return {"id":uid,"patient_id":patient_id,"username":username,"status":"created"}
+
 @app.put("/admin/users/{user_id}")
 def edit_user(user_id: str, u: UserEditIn, authorization: Optional[str] = Header(None)):
     admin = current_user(authorization); require_admin(admin)
@@ -438,6 +462,22 @@ def get_patient(patient_id: str, authorization: Optional[str] = Header(None)):
     result = dict(patient); result["visits"] = [dict(v) for v in visits]
     return result
 
+@app.put("/patients/{patient_id}")
+def update_patient(patient_id: str, p: PatientIn, authorization: Optional[str] = Header(None)):
+    """Only clinic staff may update demographics for a patient in their own clinic."""
+    user = current_user(authorization); require_staff(user)
+    conn = get_db()
+    patient = conn.execute("SELECT * FROM patients WHERE id=?", (patient_id,)).fetchone()
+    if not patient or patient["clinic_id"] != user["clinic_id"]:
+        conn.close(); raise HTTPException(404, "Bemor topilmadi")
+    conn.execute("UPDATE patients SET full_name=?,birth_date=?,gender=?,phone=?,address=?,family_doctor=?,region=?,district=? WHERE id=?",
+        (p.full_name, p.birth_date, p.gender, p.phone, p.address, p.family_doctor, p.region, p.district, patient_id))
+    # Keep the linked patient account in sync without changing its login or password.
+    conn.execute("UPDATE users SET full_name=?,phone=?,birth_date=? WHERE patient_id=? AND role='bemor'",
+        (p.full_name, p.phone, p.birth_date, patient_id))
+    conn.commit(); conn.close()
+    return {"status":"yangilandi"}
+
 @app.delete("/patients/{patient_id}")
 def delete_patient(patient_id: str, authorization: Optional[str] = Header(None)):
     user = current_user(authorization); require_staff(user)
@@ -462,6 +502,19 @@ def add_visit(patient_id: str, v: VisitIn, authorization: Optional[str] = Header
                  (vid, patient_id, v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.next_visit_date, v.inn_name))
     conn.commit(); conn.close()
     return {"id": vid}
+
+@app.put("/visits/{visit_id}")
+def update_visit(visit_id: str, v: VisitIn, authorization: Optional[str] = Header(None)):
+    """Only staff of the patient's clinic may edit a visit."""
+    user = current_user(authorization); require_staff(user)
+    conn = get_db()
+    row = conn.execute("SELECT visits.id, visits.patient_id, patients.clinic_id FROM visits JOIN patients ON patients.id=visits.patient_id WHERE visits.id=?", (visit_id,)).fetchone()
+    if not row or row["clinic_id"] != user["clinic_id"]:
+        conn.close(); raise HTTPException(404, "Tashrif topilmadi")
+    conn.execute("UPDATE visits SET date=?,doctor=?,complaint=?,diagnosis=?,prescription=?,next_visit_date=?,inn_name=? WHERE id=?",
+        (v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.next_visit_date, v.inn_name, visit_id))
+    conn.commit(); conn.close()
+    return {"status":"yangilandi"}
 
 @app.get("/reminders")
 def reminders(authorization: Optional[str] = Header(None)):
