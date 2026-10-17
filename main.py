@@ -38,7 +38,7 @@ def init_db():
         full_name TEXT NOT NULL, birth_date TEXT, gender TEXT, phone TEXT, address TEXT, family_doctor TEXT,
         region TEXT, district TEXT, clinic_id TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS visits (id TEXT PRIMARY KEY, patient_id TEXT NOT NULL,
-        date TEXT, doctor TEXT, complaint TEXT, diagnosis TEXT, prescription TEXT, next_visit_date TEXT, inn_name TEXT,
+        date TEXT, doctor TEXT, complaint TEXT, diagnosis TEXT, prescription TEXT, lab_result TEXT, next_visit_date TEXT, inn_name TEXT,
         FOREIGN KEY(patient_id) REFERENCES patients(id))""")
     conn.execute("""CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL, role TEXT NOT NULL, full_name TEXT, patient_id TEXT,
@@ -52,14 +52,15 @@ def init_db():
         sender_role TEXT, sender_name TEXT, body TEXT, created_at TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS appointments (id TEXT PRIMARY KEY, clinic_id TEXT NOT NULL,
         patient_id TEXT NOT NULL, patient_name TEXT, doctor_name TEXT, date TEXT, queue_number INTEGER,
-        status TEXT DEFAULT 'kutilmoqda', created_at TEXT, checked_in_at TEXT)""")
+        status TEXT DEFAULT 'kutilmoqda', created_at TEXT, checked_in_at TEXT, time TEXT)""")
     for stmt in ["ALTER TABLE visits ADD COLUMN next_visit_date TEXT", "ALTER TABLE visits ADD COLUMN inn_name TEXT",
+                 "ALTER TABLE visits ADD COLUMN lab_result TEXT", "ALTER TABLE appointments ADD COLUMN time TEXT",
                  "ALTER TABLE users ADD COLUMN email TEXT", "ALTER TABLE users ADD COLUMN phone TEXT",
                  "ALTER TABLE users ADD COLUMN avatar TEXT", "ALTER TABLE users ADD COLUMN region TEXT",
                  "ALTER TABLE users ADD COLUMN district TEXT", "ALTER TABLE users ADD COLUMN clinic_id TEXT",
                  "ALTER TABLE users ADD COLUMN birth_date TEXT",
                  "ALTER TABLE patients ADD COLUMN region TEXT", "ALTER TABLE patients ADD COLUMN district TEXT",
-                 "ALTER TABLE patients ADD COLUMN clinic_id TEXT"]:
+                 "ALTER TABLE patients ADD COLUMN clinic_id TEXT", "ALTER TABLE patients ADD COLUMN health_status TEXT"]:
         try: conn.execute(stmt)
         except sqlite3.OperationalError: pass
 
@@ -137,16 +138,16 @@ class UserEditIn(BaseModel):
 class PatientIn(BaseModel):
     full_name: str; birth_date: Optional[str]=None; gender: Optional[str]=None
     phone: Optional[str]=None; address: Optional[str]=None; family_doctor: Optional[str]=None
-    region: Optional[str]=None; district: Optional[str]=None
+    region: Optional[str]=None; district: Optional[str]=None; health_status: Optional[str]=None
 class VisitIn(BaseModel):
     date: str; doctor: Optional[str]=None; complaint: Optional[str]=None
-    diagnosis: Optional[str]=None; prescription: Optional[str]=None; next_visit_date: Optional[str]=None
+    diagnosis: Optional[str]=None; prescription: Optional[str]=None; lab_result: Optional[str]=None; next_visit_date: Optional[str]=None
     inn_name: Optional[str]=None
 class PatientCredentialsIn(BaseModel): username: str; password: str
 
 class MessageIn(BaseModel): body: str
 class RatingIn(BaseModel): doctor_name: str; stars: int; comment: Optional[str]=None
-class AppointmentIn(BaseModel): doctor_name: str; date: str
+class AppointmentIn(BaseModel): doctor_name: str; date: str; time: str
 
 # ---------- Auth ----------
 def login_payload(conn, user):
@@ -459,19 +460,29 @@ def get_patient(patient_id: str, authorization: Optional[str] = Header(None)):
         conn.close(); raise HTTPException(403, "Bu bemor sizning klinikangizga tegishli emas")
     visits = conn.execute("SELECT * FROM visits WHERE patient_id=? ORDER BY date DESC", (patient_id,)).fetchall()
     conn.close()
-    result = dict(patient); result["visits"] = [dict(v) for v in visits]
+    # Keep the canonical snake_case field and provide a compatibility alias for
+    # older clients that read labResult instead of lab_result.
+    normalized_visits = []
+    for visit in visits:
+        item = dict(visit)
+        item["lab_result"] = item.get("lab_result") or ""
+        item["labResult"] = item["lab_result"]
+        normalized_visits.append(item)
+    result = dict(patient); result["visits"] = normalized_visits
     return result
 
 @app.put("/patients/{patient_id}")
 def update_patient(patient_id: str, p: PatientIn, authorization: Optional[str] = Header(None)):
     """Only clinic staff may update demographics for a patient in their own clinic."""
     user = current_user(authorization); require_staff(user)
+    if p.health_status is not None and p.health_status not in ("Yaxshi", "Shifokor nazoratida", "Shoshilinch"):
+        raise HTTPException(400, "Sog'liq holati noto'g'ri")
     conn = get_db()
     patient = conn.execute("SELECT * FROM patients WHERE id=?", (patient_id,)).fetchone()
     if not patient or patient["clinic_id"] != user["clinic_id"]:
         conn.close(); raise HTTPException(404, "Bemor topilmadi")
-    conn.execute("UPDATE patients SET full_name=?,birth_date=?,gender=?,phone=?,address=?,family_doctor=?,region=?,district=? WHERE id=?",
-        (p.full_name, p.birth_date, p.gender, p.phone, p.address, p.family_doctor, p.region, p.district, patient_id))
+    conn.execute("UPDATE patients SET full_name=?,birth_date=?,gender=?,phone=?,address=?,family_doctor=?,region=?,district=?,health_status=COALESCE(?,health_status) WHERE id=?",
+        (p.full_name, p.birth_date, p.gender, p.phone, p.address, p.family_doctor, p.region, p.district, p.health_status, patient_id))
     # Keep the linked patient account in sync without changing its login or password.
     conn.execute("UPDATE users SET full_name=?,phone=?,birth_date=? WHERE patient_id=? AND role='bemor'",
         (p.full_name, p.phone, p.birth_date, patient_id))
@@ -498,8 +509,8 @@ def add_visit(patient_id: str, v: VisitIn, authorization: Optional[str] = Header
     if not patient or patient["clinic_id"] != user["clinic_id"]:
         conn.close(); raise HTTPException(404, "Bemor topilmadi")
     vid = str(uuid.uuid4())
-    conn.execute("INSERT INTO visits (id, patient_id, date, doctor, complaint, diagnosis, prescription, next_visit_date, inn_name) VALUES (?,?,?,?,?,?,?,?,?)",
-                 (vid, patient_id, v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.next_visit_date, v.inn_name))
+    conn.execute("INSERT INTO visits (id, patient_id, date, doctor, complaint, diagnosis, prescription, lab_result, next_visit_date, inn_name) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                 (vid, patient_id, v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.lab_result, v.next_visit_date, v.inn_name))
     conn.commit(); conn.close()
     return {"id": vid}
 
@@ -511,8 +522,8 @@ def update_visit(visit_id: str, v: VisitIn, authorization: Optional[str] = Heade
     row = conn.execute("SELECT visits.id, visits.patient_id, patients.clinic_id FROM visits JOIN patients ON patients.id=visits.patient_id WHERE visits.id=?", (visit_id,)).fetchone()
     if not row or row["clinic_id"] != user["clinic_id"]:
         conn.close(); raise HTTPException(404, "Tashrif topilmadi")
-    conn.execute("UPDATE visits SET date=?,doctor=?,complaint=?,diagnosis=?,prescription=?,next_visit_date=?,inn_name=? WHERE id=?",
-        (v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.next_visit_date, v.inn_name, visit_id))
+    conn.execute("UPDATE visits SET date=?,doctor=?,complaint=?,diagnosis=?,prescription=?,lab_result=?,next_visit_date=?,inn_name=? WHERE id=?",
+        (v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.lab_result, v.next_visit_date, v.inn_name, visit_id))
     conn.commit(); conn.close()
     return {"status":"yangilandi"}
 
@@ -701,15 +712,23 @@ def book_appointment(a: AppointmentIn, authorization: Optional[str] = Header(Non
     user = current_user(authorization)
     if user["role"] != "bemor": raise HTTPException(403, "Faqat bemor navbat olishi mumkin")
     conn = get_db()
-    existing = conn.execute("SELECT COUNT(*) as c FROM appointments WHERE clinic_id=? AND doctor_name=? AND date=? AND status != 'bekor qilindi'",
-                             (user["clinic_id"], a.doctor_name, a.date)).fetchone()["c"]
+    if not a.time or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", a.time):
+        conn.close(); raise HTTPException(400, "Qabul vaqtini toʻgʻri tanlang")
+    try:
+        appointment_date = datetime.date.fromisoformat(a.date)
+    except (TypeError, ValueError):
+        conn.close(); raise HTTPException(400, "Qabul sanasini toʻgʻri kiriting")
+    if appointment_date < datetime.date.today():
+        conn.close(); raise HTTPException(400, "O‘tgan sanaga qabul tanlab bo‘lmaydi")
+    existing = conn.execute("SELECT COUNT(*) as c FROM appointments WHERE clinic_id=? AND doctor_name=? AND date=? AND time=? AND status != 'bekor qilindi'",
+                             (user["clinic_id"], a.doctor_name, a.date, a.time)).fetchone()["c"]
     queue_number = existing + 1
     aid = str(uuid.uuid4())
     patient = conn.execute("SELECT full_name FROM patients WHERE id=?", (user["patient_id"],)).fetchone()
-    conn.execute("""INSERT INTO appointments (id, clinic_id, patient_id, patient_name, doctor_name, date, queue_number, status, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)""",
+    conn.execute("""INSERT INTO appointments (id, clinic_id, patient_id, patient_name, doctor_name, date, queue_number, status, created_at, time)
+        VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (aid, user["clinic_id"], user["patient_id"], patient["full_name"] if patient else "", a.doctor_name, a.date,
-         queue_number, "kutilmoqda", datetime.datetime.utcnow().isoformat()))
+         queue_number, "kutilmoqda", datetime.datetime.utcnow().isoformat(), a.time))
     conn.commit(); conn.close()
     return {"id": aid, "queue_number": queue_number}
 
@@ -718,13 +737,13 @@ def my_appointments(authorization: Optional[str] = Header(None)):
     user = current_user(authorization)
     if user["role"] != "bemor": raise HTTPException(403, "Faqat bemor uchun")
     conn = get_db()
-    rows = conn.execute("SELECT * FROM appointments WHERE patient_id=? ORDER BY date DESC, queue_number ASC", (user["patient_id"],)).fetchall()
+    rows = conn.execute("SELECT * FROM appointments WHERE patient_id=? ORDER BY date DESC, time ASC, queue_number ASC", (user["patient_id"],)).fetchall()
     result = []
     for r in rows:
         ahead = 0
         if r["status"] == "kutilmoqda":
-            ahead = conn.execute("""SELECT COUNT(*) as c FROM appointments WHERE clinic_id=? AND doctor_name=? AND date=?
-                AND status='kutilmoqda' AND queue_number < ?""", (r["clinic_id"], r["doctor_name"], r["date"], r["queue_number"])).fetchone()["c"]
+            ahead = conn.execute("""SELECT COUNT(*) as c FROM appointments WHERE clinic_id=? AND doctor_name=? AND date=? AND time=?
+                AND status='kutilmoqda' AND queue_number < ?""", (r["clinic_id"], r["doctor_name"], r["date"], r["time"], r["queue_number"])).fetchone()["c"]
         result.append({**dict(r), "ahead_count": ahead})
     conn.close()
     return result
@@ -735,10 +754,10 @@ def appointments_today(date: Optional[str] = None, authorization: Optional[str] 
     the_date = date or datetime.date.today().isoformat()
     conn = get_db()
     if user["role"] == "shifokor":
-        rows = conn.execute("SELECT * FROM appointments WHERE clinic_id=? AND date=? AND doctor_name=? ORDER BY queue_number ASC",
+        rows = conn.execute("SELECT * FROM appointments WHERE clinic_id=? AND date=? AND doctor_name=? ORDER BY time ASC, queue_number ASC",
                              (user["clinic_id"], the_date, user["full_name"])).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM appointments WHERE clinic_id=? AND date=? ORDER BY doctor_name, queue_number ASC",
+        rows = conn.execute("SELECT * FROM appointments WHERE clinic_id=? AND date=? ORDER BY doctor_name, time ASC, queue_number ASC",
                              (user["clinic_id"], the_date)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -769,8 +788,12 @@ def cancel_appointment(appt_id: str, authorization: Optional[str] = Header(None)
     conn = get_db()
     a = conn.execute("SELECT * FROM appointments WHERE id=?", (appt_id,)).fetchone()
     if not a: raise HTTPException(404, "Navbat topilmadi")
-    if user["role"] == "bemor" and a["patient_id"] != user["patient_id"]: raise HTTPException(403, "Ruxsat yo'q")
-    if user["role"] in ("shifokor","admin") and a["clinic_id"] != user["clinic_id"]: raise HTTPException(403, "Ruxsat yo'q")
+    if user["role"] == "bemor":
+        if a["patient_id"] != user["patient_id"]: raise HTTPException(403, "Ruxsat yo'q")
+    elif user["role"] in ("shifokor", "admin"):
+        if a["clinic_id"] != user["clinic_id"]: raise HTTPException(403, "Ruxsat yo'q")
+    else:
+        conn.close(); raise HTTPException(403, "Bu amal uchun ruxsat yo'q")
     conn.execute("UPDATE appointments SET status='bekor qilindi' WHERE id=?", (appt_id,))
     conn.commit(); conn.close()
     return {"status":"bekor qilindi"}
@@ -787,7 +810,7 @@ def dmed_export(authorization: Optional[str] = Header(None)):
         result["patients"].append({"medId": p["med_id"], "fullName": p["full_name"], "birthDate": p["birth_date"],
             "gender": p["gender"], "phone": p["phone"], "address": p["address"], "familyDoctor": p["family_doctor"],
             "encounters": [{"date": v["date"], "doctor": v["doctor"], "complaint": v["complaint"], "diagnosis": v["diagnosis"],
-                            "prescription": v["prescription"], "nextVisitDate": v["next_visit_date"], "innName": v["inn_name"]} for v in visits]})
+                            "prescription": v["prescription"], "labResult": v["lab_result"], "nextVisitDate": v["next_visit_date"], "innName": v["inn_name"]} for v in visits]})
     conn.close()
     return result
 
@@ -800,8 +823,8 @@ def dmed_import(payload: dict, authorization: Optional[str] = Header(None)):
         conn.execute("INSERT OR IGNORE INTO patients (id, med_id, full_name, birth_date, gender, phone, address, family_doctor, clinic_id) VALUES (?,?,?,?,?,?,?,?,?)",
                      (pid, med_id, d.get("fullName"), d.get("birthDate"), d.get("gender"), d.get("phone"), d.get("address"), d.get("familyDoctor"), user["clinic_id"]))
         for e in d.get("encounters", []):
-            conn.execute("INSERT INTO visits (id, patient_id, date, doctor, complaint, diagnosis, prescription, next_visit_date, inn_name) VALUES (?,?,?,?,?,?,?,?,?)",
-                         (str(uuid.uuid4()), pid, e.get("date"), e.get("doctor"), e.get("complaint"), e.get("diagnosis"), e.get("prescription"), e.get("nextVisitDate"), e.get("innName")))
+            conn.execute("INSERT INTO visits (id, patient_id, date, doctor, complaint, diagnosis, prescription, lab_result, next_visit_date, inn_name) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                         (str(uuid.uuid4()), pid, e.get("date"), e.get("doctor"), e.get("complaint"), e.get("diagnosis"), e.get("prescription"), e.get("labResult"), e.get("nextVisitDate"), e.get("innName")))
         added += 1
     conn.commit(); conn.close()
     return {"imported": added}
