@@ -53,6 +53,8 @@ def init_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS appointments (id TEXT PRIMARY KEY, clinic_id TEXT NOT NULL,
         patient_id TEXT NOT NULL, patient_name TEXT, doctor_name TEXT, date TEXT, queue_number INTEGER,
         status TEXT DEFAULT 'kutilmoqda', created_at TEXT, checked_in_at TEXT, time TEXT)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS notifications (id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+        title TEXT NOT NULL, body TEXT, kind TEXT, target_url TEXT, created_at TEXT NOT NULL, read_at TEXT)""")
     for stmt in ["ALTER TABLE visits ADD COLUMN next_visit_date TEXT", "ALTER TABLE visits ADD COLUMN inn_name TEXT",
                  "ALTER TABLE visits ADD COLUMN lab_result TEXT", "ALTER TABLE appointments ADD COLUMN time TEXT",
                  "ALTER TABLE users ADD COLUMN email TEXT", "ALTER TABLE users ADD COLUMN phone TEXT",
@@ -60,7 +62,8 @@ def init_db():
                  "ALTER TABLE users ADD COLUMN district TEXT", "ALTER TABLE users ADD COLUMN clinic_id TEXT",
                  "ALTER TABLE users ADD COLUMN birth_date TEXT",
                  "ALTER TABLE patients ADD COLUMN region TEXT", "ALTER TABLE patients ADD COLUMN district TEXT",
-                 "ALTER TABLE patients ADD COLUMN clinic_id TEXT", "ALTER TABLE patients ADD COLUMN health_status TEXT"]:
+                 "ALTER TABLE patients ADD COLUMN clinic_id TEXT", "ALTER TABLE patients ADD COLUMN health_status TEXT",
+                 "ALTER TABLE visits ADD COLUMN prescription_archived INTEGER NOT NULL DEFAULT 0"]:
         try: conn.execute(stmt)
         except sqlite3.OperationalError: pass
 
@@ -104,6 +107,32 @@ def require_admin(u):
 def require_super(u):
     if u["role"] != "super_admin": raise HTTPException(403, "Faqat tizim egasi uchun")
 def clinic_of(u): return u["clinic_id"]
+def notify_users(conn, clinic_id, title, body, kind, roles=("shifokor", "admin"), patient_id=None):
+    """Create in-app notifications for permitted recipients in the same clinic."""
+    now = datetime.datetime.utcnow().isoformat()
+    if patient_id:
+        recipients = conn.execute("SELECT id FROM users WHERE patient_id=?", (patient_id,)).fetchall()
+    else:
+        placeholders = ",".join("?" for _ in roles)
+        recipients = conn.execute(f"SELECT id FROM users WHERE clinic_id=? AND role IN ({placeholders})", (clinic_id, *roles)).fetchall()
+    for recipient in recipients:
+        conn.execute("INSERT INTO notifications (id,user_id,title,body,kind,target_url,created_at,read_at) VALUES (?,?,?,?,?,?,?,NULL)",
+            (str(uuid.uuid4()), recipient["id"], title, body, kind, None, now))
+
+def valid_appointment_slot(date_str, time_str):
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", time_str or ""):
+        return False, "Qabul vaqtini toʻgʻri tanlang"
+    try:
+        dt = datetime.datetime.combine(datetime.date.fromisoformat(date_str), datetime.time.fromisoformat(time_str))
+    except (TypeError, ValueError):
+        return False, "Qabul sanasi yoki vaqtini toʻgʻri kiriting"
+    minutes = dt.hour * 60 + dt.minute
+    if minutes % 30 != 0 or not (480 <= minutes <= 750 or 840 <= minutes <= 1050):
+        return False, "Qabul vaqti 08:00–12:30 yoki 14:00–17:30 oraligʻida, 30 daqiqalik qadamda boʻlishi kerak"
+    uz_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5))).replace(tzinfo=None)
+    if dt <= uz_now:
+        return False, "Oʻtib ketgan vaqtga navbat olib boʻlmaydi"
+    return True, ""
 def can_view_patient(u, patient_clinic_id, patient_id):
     if u["role"] in ("shifokor","admin"): return u["clinic_id"] == patient_clinic_id
     return u["patient_id"] == patient_id
@@ -509,8 +538,14 @@ def add_visit(patient_id: str, v: VisitIn, authorization: Optional[str] = Header
     if not patient or patient["clinic_id"] != user["clinic_id"]:
         conn.close(); raise HTTPException(404, "Bemor topilmadi")
     vid = str(uuid.uuid4())
+    # Har bir yangi tashrif eski faol retseptlarni arxivlaydi; yangi retsept bo'lsa u faol qoladi.
+    conn.execute("UPDATE visits SET prescription_archived=1 WHERE patient_id=? AND prescription IS NOT NULL AND prescription!=''", (patient_id,))
     conn.execute("INSERT INTO visits (id, patient_id, date, doctor, complaint, diagnosis, prescription, lab_result, next_visit_date, inn_name) VALUES (?,?,?,?,?,?,?,?,?,?)",
                  (vid, patient_id, v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.lab_result, v.next_visit_date, v.inn_name))
+    if v.prescription and v.prescription.strip():
+        notify_users(conn, patient["clinic_id"], "Yangi retsept yozildi", f"Yangi retsept: {v.prescription[:120]}", "prescription", patient_id=patient_id)
+    if v.lab_result and v.lab_result.strip():
+        notify_users(conn, patient["clinic_id"], "Tahlil natijasi tayyor", "Shifokor tahlil natijasini kiritdi.", "lab_result", patient_id=patient_id)
     conn.commit(); conn.close()
     return {"id": vid}
 
@@ -522,7 +557,9 @@ def update_visit(visit_id: str, v: VisitIn, authorization: Optional[str] = Heade
     row = conn.execute("SELECT visits.id, visits.patient_id, patients.clinic_id FROM visits JOIN patients ON patients.id=visits.patient_id WHERE visits.id=?", (visit_id,)).fetchone()
     if not row or row["clinic_id"] != user["clinic_id"]:
         conn.close(); raise HTTPException(404, "Tashrif topilmadi")
-    conn.execute("UPDATE visits SET date=?,doctor=?,complaint=?,diagnosis=?,prescription=?,lab_result=?,next_visit_date=?,inn_name=? WHERE id=?",
+    if v.prescription and v.prescription.strip():
+        conn.execute("UPDATE visits SET prescription_archived=1 WHERE patient_id=? AND id!=? AND prescription IS NOT NULL AND prescription!=''", (row["patient_id"], visit_id))
+    conn.execute("UPDATE visits SET date=?,doctor=?,complaint=?,diagnosis=?,prescription=?,prescription_archived=0,lab_result=?,next_visit_date=?,inn_name=? WHERE id=?",
         (v.date, v.doctor, v.complaint, v.diagnosis, v.prescription, v.lab_result, v.next_visit_date, v.inn_name, visit_id))
     conn.commit(); conn.close()
     return {"status":"yangilandi"}
@@ -572,6 +609,10 @@ def send_message(patient_id: str, m: MessageIn, authorization: Optional[str] = H
     mid = str(uuid.uuid4())
     conn.execute("INSERT INTO messages (id, patient_id, sender_role, sender_name, body, created_at) VALUES (?,?,?,?,?,?)",
                  (mid, patient_id, user["role"], user["full_name"], m.body, datetime.datetime.utcnow().isoformat()))
+    if user["role"] == "bemor":
+        notify_users(conn, patient["clinic_id"], "Yangi bemor xabari", f"{user['full_name']}: {m.body[:120]}", "message")
+    else:
+        notify_users(conn, patient["clinic_id"], "Shifokordan yangi xabar", f"{user['full_name']}: {m.body[:120]}", "message", patient_id=patient_id)
     conn.commit(); conn.close()
     return {"id": mid}
 
@@ -646,12 +687,46 @@ def add_rating(patient_id: str, r: RatingIn, authorization: Optional[str] = Head
     if user["role"] != "bemor" or user["patient_id"] != patient_id: raise HTTPException(403, "Faqat o'zingiz uchun")
     if not (1 <= r.stars <= 5): raise HTTPException(400, "Baho 1 dan 5 gacha")
     conn = get_db()
-    patient = conn.execute("SELECT full_name FROM patients WHERE id=?", (patient_id,)).fetchone()
+    patient = conn.execute("SELECT full_name, clinic_id FROM patients WHERE id=?", (patient_id,)).fetchone()
+    if not patient:
+        conn.close(); raise HTTPException(404, "Bemor topilmadi")
+    exists = conn.execute("SELECT id FROM ratings WHERE patient_id=? AND doctor_name=?", (patient_id, r.doctor_name)).fetchone()
+    if exists:
+        conn.close(); raise HTTPException(409, "Siz bu shifokorga allaqachon sharh qoldirgansiz")
     rid = str(uuid.uuid4())
     conn.execute("INSERT INTO ratings (id, patient_id, patient_name, doctor_name, stars, comment, created_at) VALUES (?,?,?,?,?,?,?)",
-                 (rid, patient_id, patient["full_name"] if patient else "", r.doctor_name, r.stars, r.comment, datetime.datetime.utcnow().isoformat()))
+                 (rid, patient_id, patient["full_name"], r.doctor_name, r.stars, r.comment, datetime.datetime.utcnow().isoformat()))
+    notify_users(conn, patient["clinic_id"], "Yangi sharh qoldirildi", f"{patient['full_name']} · {r.stars}/5 yulduz", "rating")
     conn.commit(); conn.close()
     return {"id": rid}
+
+@app.get("/doctors/{doctor_name}/ratings")
+def public_doctor_ratings(doctor_name: str, authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    conn = get_db()
+    rows = conn.execute("""SELECT ratings.patient_name, ratings.doctor_name, ratings.stars, ratings.comment, ratings.created_at
+        FROM ratings JOIN patients ON patients.id=ratings.patient_id
+        WHERE patients.clinic_id=? AND ratings.doctor_name=? ORDER BY ratings.created_at DESC""",
+        (user["clinic_id"], doctor_name)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.get("/notifications")
+def list_notifications(authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 100", (user["id"],)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.post("/notifications/read")
+def mark_notifications_read(authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    conn = get_db()
+    now = datetime.datetime.utcnow().isoformat()
+    conn.execute("UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL", (now, user["id"]))
+    conn.commit(); conn.close()
+    return {"status":"ok", "read_at":now}
 
 @app.get("/doctors/summary")
 def doctors_summary(authorization: Optional[str] = Header(None)):
@@ -707,19 +782,29 @@ def doctor_stats(period: str = "daily", authorization: Optional[str] = Header(No
             "avg_stars": round(rating["avg_stars"],1) if rating["avg_stars"] else None, "rating_count": rating["cnt"]}
 
 # ---------- Navbat olish (QR bilan) ----------
+@app.get("/appointments/estimate")
+def estimate_appointment(doctor_name: str, date: str, time: str, authorization: Optional[str] = Header(None)):
+    user = current_user(authorization)
+    if user["role"] != "bemor": raise HTTPException(403, "Faqat bemor uchun")
+    valid, error = valid_appointment_slot(date, time)
+    if not valid: raise HTTPException(400, error)
+    conn = get_db()
+    ahead = conn.execute("SELECT COUNT(*) AS c FROM appointments WHERE clinic_id=? AND doctor_name=? AND date=? AND time=? AND status!='bekor qilindi'",
+        (user["clinic_id"], doctor_name, date, time)).fetchone()["c"]
+    wait_minutes = int(ahead) * 10
+    start_dt = datetime.datetime.combine(datetime.date.fromisoformat(date), datetime.time.fromisoformat(time))
+    until = (start_dt + datetime.timedelta(minutes=wait_minutes)).strftime("%H:%M")
+    conn.close()
+    return {"waiting_from":time,"waiting_until":until,"estimated_wait_minutes":wait_minutes,"queue_position":ahead+1}
+
 @app.post("/appointments")
 def book_appointment(a: AppointmentIn, authorization: Optional[str] = Header(None)):
     user = current_user(authorization)
     if user["role"] != "bemor": raise HTTPException(403, "Faqat bemor navbat olishi mumkin")
     conn = get_db()
-    if not a.time or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", a.time):
-        conn.close(); raise HTTPException(400, "Qabul vaqtini toʻgʻri tanlang")
-    try:
-        appointment_date = datetime.date.fromisoformat(a.date)
-    except (TypeError, ValueError):
-        conn.close(); raise HTTPException(400, "Qabul sanasini toʻgʻri kiriting")
-    if appointment_date < datetime.date.today():
-        conn.close(); raise HTTPException(400, "O‘tgan sanaga qabul tanlab bo‘lmaydi")
+    valid, error = valid_appointment_slot(a.date, a.time)
+    if not valid:
+        conn.close(); raise HTTPException(400, error)
     existing = conn.execute("SELECT COUNT(*) as c FROM appointments WHERE clinic_id=? AND doctor_name=? AND date=? AND time=? AND status != 'bekor qilindi'",
                              (user["clinic_id"], a.doctor_name, a.date, a.time)).fetchone()["c"]
     queue_number = existing + 1
@@ -729,8 +814,12 @@ def book_appointment(a: AppointmentIn, authorization: Optional[str] = Header(Non
         VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (aid, user["clinic_id"], user["patient_id"], patient["full_name"] if patient else "", a.doctor_name, a.date,
          queue_number, "kutilmoqda", datetime.datetime.utcnow().isoformat(), a.time))
+    notify_users(conn, user["clinic_id"], "Yangi navbat olindi", f"{patient['full_name'] if patient else 'Bemor'} · {a.date} {a.time} · №{queue_number}", "appointment")
+    wait_minutes = max(0, (queue_number - 1) * 10)
+    start_dt = datetime.datetime.combine(datetime.date.fromisoformat(a.date), datetime.time.fromisoformat(a.time))
+    end_dt = start_dt + datetime.timedelta(minutes=wait_minutes)
     conn.commit(); conn.close()
-    return {"id": aid, "queue_number": queue_number}
+    return {"id": aid, "queue_number": queue_number, "waiting_from": a.time, "waiting_until": end_dt.strftime("%H:%M"), "estimated_wait_minutes": wait_minutes}
 
 @app.get("/appointments/me")
 def my_appointments(authorization: Optional[str] = Header(None)):
@@ -744,7 +833,14 @@ def my_appointments(authorization: Optional[str] = Header(None)):
         if r["status"] == "kutilmoqda":
             ahead = conn.execute("""SELECT COUNT(*) as c FROM appointments WHERE clinic_id=? AND doctor_name=? AND date=? AND time=?
                 AND status='kutilmoqda' AND queue_number < ?""", (r["clinic_id"], r["doctor_name"], r["date"], r["time"], r["queue_number"])).fetchone()["c"]
-        result.append({**dict(r), "ahead_count": ahead})
+        item = dict(r)
+        wait_minutes = max(0, (int(r["queue_number"] or 1) - 1) * 10)
+        try:
+            t0 = datetime.datetime.combine(datetime.date.fromisoformat(r["date"]), datetime.time.fromisoformat(r["time"] or "08:00"))
+            item["waiting_until"] = (t0 + datetime.timedelta(minutes=wait_minutes)).strftime("%H:%M")
+        except (ValueError, TypeError):
+            item["waiting_until"] = r["time"]
+        result.append({**item, "ahead_count": ahead, "estimated_wait_minutes": wait_minutes})
     conn.close()
     return result
 
